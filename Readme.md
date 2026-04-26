@@ -1,3 +1,30 @@
+## Update — April 2026: MSMARCO Benchmark Results
+
+Ran the MLX port against 300 real MSMARCO passages (37 queries, 5–10 passages each) using the Qwen3 reranking chat template. Short version: **no measurable speedup** on natural MSMARCO batches.
+
+The reason is structural. The compression formula is:
+
+```
+compression = N × (prefix + doc) / (prefix + N × doc)
+```
+
+With MSMARCO's natural batching (N ≈ 8, prefix ≈ 80 tokens, doc ≈ 400 tokens), compression ≈ 1.17×. That's too small to beat Python overhead at 1000–2000 total tokens per batch.
+
+The synthetic benchmark (`mlx/benchmark.py`) tells a different story: when the shared prefix dominates (200–384 tokens vs 32-token unique suffix), speedup is 2.7–3.5× on Qwen3-0.6B.
+
+**When RadixMLP pays off:**
+
+| Scenario | Prefix | Doc | N | Compression | Speedup |
+|----------|--------|-----|---|-------------|---------|
+| MSMARCO reranking (natural) | 80 tok | 400 tok | 8 | 1.2× | ~1.0× |
+| Long query reranking | 250 tok | 200 tok | 16 | 2.5× | ~1.5× |
+| Synthetic (this port) | 200 tok | 32 tok | 8 | 4.1× | 2.7× |
+| Synthetic (this port, large) | 384 tok | 32 tok | 8 | 5.2× | 3.5× |
+
+The optimization is most useful for: long shared system prompts, server-side batching of concurrent requests sharing the same prefix, or RAG scenarios where a long document context is shared across many queries. Short-prefix embedding workloads (standard MSMARCO passage encoding) don't benefit.
+
+---
+
 # Devlog: Porting RadixMLP to MLX
 
 *April 2026 — Shubham Rasal*
