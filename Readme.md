@@ -1,3 +1,107 @@
+# Devlog: Porting RadixMLP to MLX
+
+*April 2026 — Shubham Rasal*
+
+---
+
+## What is RadixMLP?
+
+When you run a batch of sequences through a transformer, a lot of them share a common prefix — a system prompt, a document header, whatever. A normal model doesn't care. It processes every token in every sequence, even if those tokens are identical across the whole batch.
+
+RadixMLP exploits a simple observation: **the MLP in a transformer is stateless**. Each token's MLP output depends only on that token's hidden state — not on any neighbors. Attention is different; it needs to see the full sequence. But MLP? You can compute it once for a shared prefix token and reuse it everywhere.
+
+The original repo implements this in Rust with PyTorch bindings and a CUDA kernel. The core idea is a **trie** (prefix tree) over your batch of sequences. Walk every sequence through the trie simultaneously; wherever two sequences share a token at the same depth, they share a trie node. Tokens that map to the same trie node only need to run through MLP once.
+
+This gives you two index arrays:
+- `fold_gather` — picks the unique tokens out of your original batch (original → compact)
+- `scatter_indices` — maps them back after the MLP (compact → original)
+
+---
+
+## Why MLX?
+
+The original implementation requires CUDA. I wanted to run this on Apple Silicon without any GPU or Rust build step. MLX is Apple's ML framework for M-series chips — it supports Metal, has lazy evaluation, and is reasonably fast for inference.
+
+The goal: pure Python + MLX, no Rust, no CUDA, weights loaded straight from HuggingFace.
+
+---
+
+## The Port
+
+Three files, each doing one thing:
+
+**`compute_fold_and_scatter.py`** — the trie in plain Python. About 30 lines. Takes `input_ids` and cumulative sequence lengths, walks a dict-of-dicts trie, and spits out `fold_gather` and `scatter_indices`. No dependencies.
+
+**`model.py`** — a full Qwen3 transformer in MLX. Attention, MLP, RMSNorm, RoPE, grouped-query attention. The twist is the per-layer logic:
+
+```
+compact tokens → norm → Q/K/V → RoPE
+              → scatter to original space (mx.take)
+              → per-sequence causal attention (one call per sequence)
+              → fold back to compact space (mx.take)
+              → o_proj → norm → MLP   ← only compact tokens here
+```
+
+MLX's `mx.fast.scaled_dot_product_attention` handles GQA natively (no need to tile K/V heads manually), and `mx.take` is the equivalent of PyTorch's `index_select`.
+
+**`benchmark.py`** — loads Qwen3-0.6B weights from HuggingFace, builds a synthetic batch with a shared prefix, and times forward passes with and without the optimization.
+
+---
+
+## Results
+
+Tested on Qwen3-0.6B, batch of 8 sequences, varying prefix length.
+
+```
+prefix   compression   baseline   radix     speedup
+------   -----------   --------   -----     -------
+    32        1.78x     120 ms    81 ms      1.47x
+    64        2.40x     165 ms    87 ms      1.89x
+   128        3.33x     271 ms   112 ms      2.42x
+   200        4.07x     397 ms   148 ms      2.68x
+   256        4.50x     491 ms   156 ms      3.15x
+   384        5.20x     733 ms   208 ms      3.53x
+```
+
+At a 200-token shared prefix (4× compression), we get **2.7× speedup**. At 384 tokens (5.2× compression), **3.5× speedup**.
+
+The speedup is real but doesn't match compression 1-to-1 because attention still runs on all N tokens. Only MLP is deduplicated. As the model gets bigger, MLP takes a larger fraction of total compute (the FFN hidden size grows faster than attention hidden size), so the gains would scale up with model size — consistent with the original paper showing 5× on an 8B model.
+
+---
+
+## Correctness
+
+Output difference vs baseline: max 2e-2, mean 1e-4. This is pure floating-point drift — the weights are bfloat16, and running 28 layers in two slightly different computation orders accumulates rounding differences. The mean error is essentially zero; the max is in the last decimal place of bfloat16 precision.
+
+---
+
+## What didn't work immediately
+
+**Attention masking across sequences.** Initially I ran a single big attention over the whole batch with a block-diagonal mask. This was wrong — each sequence needs its own causal mask and shouldn't attend across boundaries. Fixed by looping over sequences and calling attention individually.
+
+**`mx.take` vs `index_select`.** MLX's equivalent is `mx.take(tensor, indices, axis=0)`. The semantics are identical, just a different name.
+
+**Weight name mismatch.** HuggingFace weights have a `model.` prefix on everything (`model.layers.0.self_attn.q_proj.weight`). My model doesn't. A one-line `removeprefix("model.")` fixed it.
+
+---
+
+## What's interesting about this
+
+The trie is the elegant part. You don't have to do anything clever in the model — just build the right index arrays ahead of time, and `mx.take` does the rest. The model itself stays simple and clean. All the prefix-sharing logic lives in a 30-line pure Python function that runs on CPU in microseconds.
+
+This also means it's completely framework-agnostic. The same `fold_gather` and `scatter_indices` arrays work with PyTorch, MLX, JAX — anything that has an `index_select`-style operation.
+
+---
+
+## Next steps
+
+- Try on Qwen3-1.7B and 4B to see if the speedup scales as expected
+- Benchmark on real document embedding workloads (e.g. MSMARCO) instead of synthetic data
+- The per-sequence attention loop in Python adds overhead; a batched padded-mask approach might be faster for small prefix lengths
+
+
+
+
 # RadixMLP
 
 RadixMLP enables prefix-based computation sharing for transformer models, eliminating redundant MLP activations when processing batches with shared prefixes. Achieves up to 5× speedup for embedding workloads.
